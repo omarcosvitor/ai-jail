@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-A Rust CLI tool that wraps bubblewrap (`bwrap`) to sandbox AI coding agents (Claude Code, GPT Codex, OpenCode, Crush). It replaces a bash script with config persistence (`.ai-jail` TOML), proper signal handling, and a developer-friendly CLI.
+A Rust CLI tool that wraps an OS sandbox to run AI coding agents (Claude Code, GPT Codex, OpenCode, Crush): bubblewrap (`bwrap`) on Linux, `sandbox-exec` on macOS, and Microsoft's ProcessContainer (`wxc-exec`) on Windows. It replaces a bash script with config persistence (`.ai-jail` TOML), proper signal handling, and a developer-friendly CLI.
 
 ## Project Structure
 
@@ -18,14 +18,26 @@ src/
     seccomp.rs    -- seccomp-bpf syscall filter (Linux)
     rlimits.rs    -- resource limits (NPROC, NOFILE, CORE)
     seatbelt.rs   -- sandbox-exec SBPL profile generation (macOS)
+    windows.rs    -- ProcessContainer policy handed to wxc-exec (Windows)
+    rlimits_windows.rs -- limits are the MXC job object's job (Windows)
   pty.rs          -- PTY proxy with vt100 virtual terminal (raw mode, IO loop, diff rendering)
+  pty_windows.rs  -- ConPTY proxy via portable-pty (Windows)
+  terminal_filter.rs -- control-sequence filter for the ConPTY proxy (Windows)
   statusbar.rs    -- persistent terminal status bar overlay (redraw, update check)
+  statusbar_windows.rs -- no status bar on Windows yet (stubs)
   signals.rs      -- signal forwarding + child process reaping
+  signals_windows.rs -- console control events reach the child through ConPTY (stub)
   output.rs       -- colored terminal output helpers (raw ANSI, no deps)
   bootstrap.rs    -- AI tool config generation (Claude, Codex, OpenCode)
   command.rs      -- harness/ai-memory wrapper detection, effective command names
   fsutil.rs       -- atomic file writes (0600), symlink-safe target checks
+  fsutil_windows.rs -- atomic writes locked down with icacls (Windows)
 ```
+
+Platform-specific modules are wired in `main.rs` with `#[cfg]` plus `#[path]`, so
+`pty`, `fsutil`, `signals`, and `statusbar` resolve to the Windows file on Windows
+and to the Unix file everywhere else. The rest of the code never branches on the
+platform.
 
 ## Critical Rule: Backward Compatibility
 
@@ -72,7 +84,7 @@ There are regression tests in `src/config.rs` that parse old config file formats
 ## Coding Conventions
 
 - **No async, no tokio.** This is a synchronous CLI tool.
-- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix`, `landlock`, `seccompiler` (Linux). Do not add new crates without a strong justification.
+- **Minimal dependencies.** Current deps: `lexopt`, `serde`, `toml`, `serde_json`, `vt100`, `nix`, `landlock`, `seccompiler` (Linux), `portable-pty` and `windows-sys` (Windows). Do not add new crates without a strong justification.
 - **No clap.** We use `lexopt` for argument parsing to keep the binary small.
 - **Raw ANSI for colors.** No color crate — `output.rs` handles this with raw escape codes.
 - **Warn and skip, never crash.** Missing paths, unreadable dirs, and non-critical errors produce a warning and continue. Existing `.ai-jail` files that cannot be read or parsed are fatal because silently dropping sandbox policy would fail open. Other fatal errors include no bwrap and an unavailable current directory.

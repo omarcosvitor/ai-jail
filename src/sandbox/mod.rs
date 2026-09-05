@@ -1,5 +1,7 @@
+#![cfg_attr(windows, allow(dead_code))]
+
 use crate::config::Config;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 use crate::config::MapSpec;
 use crate::output;
 use std::ffi::OsStr;
@@ -59,16 +61,24 @@ mod landlock;
 mod seatbelt;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(windows)]
+mod windows;
 
+#[cfg(unix)]
+pub(crate) mod rlimits;
+#[cfg(windows)]
+#[path = "rlimits_windows.rs"]
 pub(crate) mod rlimits;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_support;
 
 #[cfg(target_os = "linux")]
 pub use bwrap::SandboxGuard;
 #[cfg(target_os = "macos")]
 pub use seatbelt::SandboxGuard;
+#[cfg(windows)]
+pub use windows::SandboxGuard;
 
 pub(crate) const LOCKDOWN_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -500,7 +510,10 @@ pub fn dotdir_exemptions(config: &Config) -> Vec<&'static str> {
 }
 
 fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Paths below `root` that must stay visible for the sandboxed command
@@ -517,6 +530,7 @@ fn home_dir() -> PathBuf {
 /// `~/.local/bin/claude` to `~/.local/share/claude/versions/<v>` — and
 /// `/run`, which is always private and holds the NixOS system profile
 /// (#117). macOS denies by default everywhere, so it passes `/` (#120).
+#[cfg(unix)]
 pub(crate) fn command_paths_under(
     config: &Config,
     root: &Path,
@@ -533,6 +547,7 @@ pub(crate) fn command_paths_under(
     paths
 }
 
+#[cfg(unix)]
 fn command_paths_under_impl(
     cmd: &str,
     root: &Path,
@@ -639,6 +654,7 @@ fn path_exists(p: &Path) -> bool {
 /// `$DOCKER_HOST` and whose socket is not one of the paths below
 /// (Colima's `~/.colima/<profile>/docker.sock`, for one); add context
 /// parsing if that turns up in practice.
+#[cfg(unix)]
 pub(crate) fn docker_socket() -> Option<PathBuf> {
     let docker_host = std::env::var("DOCKER_HOST").ok();
     let candidates = [
@@ -655,6 +671,7 @@ pub(crate) fn docker_socket() -> Option<PathBuf> {
 /// `tcp://` and `ssh://` reach the daemon over the network and
 /// `npipe://` is a Windows named pipe; none of them is a path we can
 /// bind, so they drop out of the candidate list.
+#[cfg(unix)]
 fn docker_host_socket_path(value: &str) -> Option<PathBuf> {
     let path = PathBuf::from(value.strip_prefix("unix://")?);
     path.is_absolute().then_some(path)
@@ -664,6 +681,7 @@ fn docker_host_socket_path(value: &str) -> Option<PathBuf> {
 /// be stat'd. bwrap resolves the link itself and aborts the entire
 /// launch with `Can't find source path ...: Permission denied`, so an
 /// optional socket we cannot reach must be skipped, not mounted.
+#[cfg(unix)]
 pub(crate) fn docker_socket_usable(p: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
 
@@ -1062,6 +1080,10 @@ pub fn check() -> Result<(), String> {
     {
         seatbelt::check()
     }
+    #[cfg(windows)]
+    {
+        windows::check()
+    }
 }
 
 pub fn prepare() -> Result<SandboxGuard, String> {
@@ -1073,6 +1095,10 @@ pub fn prepare() -> Result<SandboxGuard, String> {
     {
         Ok(seatbelt::SandboxGuard)
     }
+    #[cfg(windows)]
+    {
+        windows::prepare()
+    }
 }
 
 pub fn platform_notes(config: &Config) {
@@ -1081,10 +1107,15 @@ pub fn platform_notes(config: &Config) {
             "Lockdown mode enabled: read-only project, no host write mounts, no mise.",
         );
     }
+    #[cfg(unix)]
     warn_docker_passthrough(config);
     #[cfg(target_os = "macos")]
     {
         seatbelt::platform_notes(config);
+    }
+    #[cfg(windows)]
+    {
+        windows::platform_notes(config);
     }
 }
 
@@ -1099,6 +1130,7 @@ fn docker_passthrough_active(config: &Config, socket_present: bool) -> bool {
         && config.browser_profile().is_none()
 }
 
+#[cfg(unix)]
 fn warn_docker_passthrough(config: &Config) {
     let socket_present = docker_socket().is_some();
     if docker_passthrough_active(config, socket_present) {
@@ -1177,6 +1209,11 @@ pub fn build(
             sandbox_tty,
         ))
     }
+    #[cfg(windows)]
+    {
+        let _ = sandbox_tty;
+        windows::build(guard, config, project_dir, verbose)
+    }
 }
 
 pub fn dry_run(
@@ -1195,9 +1232,14 @@ pub fn dry_run(
         let prepared = prepare_seatbelt_config(config)?;
         Ok(seatbelt::dry_run(&prepared, project_dir, verbose))
     }
+    #[cfg(windows)]
+    {
+        let _ = verbose;
+        windows::dry_run(guard, config, project_dir)
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};

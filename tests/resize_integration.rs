@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Integration test for PTY resize with scroll-region status bar.
 //!
 //! Reproduces the exact scenario: parent owns the real terminal,

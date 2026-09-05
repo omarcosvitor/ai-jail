@@ -1,8 +1,9 @@
 # ai-jail
 
 `ai-jail` runs AI coding agents in an OS sandbox: bubblewrap plus Landlock,
-seccomp, and limits on Linux; `sandbox-exec` on macOS. It is a useful layer,
-not a replacement for a disposable VM when running hostile code.
+seccomp, and limits on Linux; `sandbox-exec` on macOS; ProcessContainer on
+Windows. It is a useful layer, not a replacement for a disposable VM when
+running hostile code.
 
 ## Install
 
@@ -42,8 +43,13 @@ group-writable — the standard multi-user store layout, mode `1775`. A
 group-writable store without the sticky bit is refused, because a group member
 could then replace the binary. A single-user store owned by the invoking user
 does not qualify either.
-macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows is not
-supported; use WSL2 and the Linux backend inside it.
+macOS uses Apple's deprecated `/usr/bin/sandbox-exec` interface. Windows runs
+natively on Microsoft's ProcessContainer and needs `wxc-exec.exe` from the MXC
+SDK: `npm install -g @microsoft/mxc-sdk@0.8.0`. The binary is looked up next to
+`ai-jail.exe`, on `PATH`, and in the global npm prefix; `WXC_EXEC_BIN` overrides
+the lookup. Every run probes the backend first and refuses to start when the
+host cannot provide it, in which case WSL2 with the Linux backend inside it
+remains the fallback.
 
 ## Quick start
 
@@ -370,11 +376,18 @@ entirely with `--no-mise`.
 Linux uses namespace isolation and, where available, Landlock, seccomp, and
 resource limits. macOS has no global filesystem reads, network, or host IPC by
 default; `--agent-state` and other state mounts work on both platforms.
-Overlay maps are copy-on-write on Linux only; on macOS they are honored as
-read-only maps. `sandbox-exec` is deprecated and neither backend protects
+Overlay maps are copy-on-write on Linux only; on macOS and Windows they are
+honored as read-only maps. `sandbox-exec` is deprecated and no backend protects
 against kernel/driver vulnerabilities, terminal emulator vulnerabilities, or
 all IPC and side-channel classes. For truly hostile workloads, use a
 disposable VM.
+
+Windows grants the project directory and the paths you map, denies the rest of
+the user profile, and keeps network egress and ingress closed unless
+`--network` is set. Docker, Tailscale, and SSH-agent passthrough, the status
+bar, and alternate map destinations (`--map src:dst`) are not available there;
+`~/.ssh` and overlay maps are exposed read-only, and a symlinked global config
+is refused instead of followed.
 
 See [docs/SECURITY.md](docs/SECURITY.md) for the complete threat model,
 capability matrix, residual risks, and disclosure guidance. Release

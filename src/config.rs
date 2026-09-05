@@ -3,7 +3,9 @@ use crate::command;
 use crate::output;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -40,33 +42,76 @@ pub struct MapSpec {
 
 impl MapSpec {
     pub fn parse(value: &Path) -> Result<Self, String> {
-        let bytes = value.as_os_str().as_bytes();
-        let Some(separator) = bytes.iter().position(|byte| *byte == b':')
-        else {
-            if bytes.is_empty() {
+        #[cfg(unix)]
+        {
+            let bytes = value.as_os_str().as_bytes();
+            let Some(separator) = bytes.iter().position(|byte| *byte == b':')
+            else {
+                if bytes.is_empty() {
+                    return Err("map has empty source and destination".into());
+                }
+                return Ok(Self {
+                    source: value.to_path_buf(),
+                    destination: value.to_path_buf(),
+                });
+            };
+
+            let source = &bytes[..separator];
+            let destination = &bytes[separator + 1..];
+            if source.is_empty() {
+                return Err("map has empty source".into());
+            }
+            if destination.is_empty() {
+                return Err("map has empty destination".into());
+            }
+
+            Ok(Self {
+                source: PathBuf::from(OsString::from_vec(source.to_vec())),
+                destination: PathBuf::from(OsString::from_vec(
+                    destination.to_vec(),
+                )),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let value = value
+                .to_str()
+                .ok_or_else(|| "map must be valid UTF-8".to_string())?;
+            if value.is_empty() {
                 return Err("map has empty source and destination".into());
             }
-            return Ok(Self {
-                source: value.to_path_buf(),
-                destination: value.to_path_buf(),
-            });
-        };
-
-        let source = &bytes[..separator];
-        let destination = &bytes[separator + 1..];
-        if source.is_empty() {
-            return Err("map has empty source".into());
+            let bytes = value.as_bytes();
+            let separator =
+                bytes.iter().enumerate().find_map(|(index, byte)| {
+                    if *byte != b':' {
+                        return None;
+                    }
+                    let drive_colon = index > 0
+                        && bytes[index - 1].is_ascii_alphabetic()
+                        && bytes
+                            .get(index + 1)
+                            .is_some_and(|next| matches!(next, b'\\' | b'/'));
+                    (!drive_colon).then_some(index)
+                });
+            let Some(separator) = separator else {
+                return Ok(Self {
+                    source: PathBuf::from(value),
+                    destination: PathBuf::from(value),
+                });
+            };
+            let (source, destination) = value.split_at(separator);
+            let destination = &destination[1..];
+            if source.is_empty() {
+                return Err("map has empty source".into());
+            }
+            if destination.is_empty() {
+                return Err("map has empty destination".into());
+            }
+            Ok(Self {
+                source: PathBuf::from(source),
+                destination: PathBuf::from(destination),
+            })
         }
-        if destination.is_empty() {
-            return Err("map has empty destination".into());
-        }
-
-        Ok(Self {
-            source: PathBuf::from(OsString::from_vec(source.to_vec())),
-            destination: PathBuf::from(OsString::from_vec(
-                destination.to_vec(),
-            )),
-        })
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -87,6 +132,17 @@ impl MapSpec {
         }
         if self.destination == Path::new("/") {
             return Err("map cannot use root destination".into());
+        }
+        #[cfg(windows)]
+        {
+            if self.source.has_root() && self.source.components().count() <= 2 {
+                return Err("map cannot use volume root source".into());
+            }
+            if self.destination.has_root()
+                && self.destination.components().count() <= 2
+            {
+                return Err("map cannot use volume root destination".into());
+            }
         }
         Ok(())
     }
@@ -120,10 +176,21 @@ impl MapSpec {
             return self.source.clone();
         }
 
-        let mut encoded = self.source.as_os_str().as_bytes().to_vec();
-        encoded.push(b':');
-        encoded.extend_from_slice(self.destination.as_os_str().as_bytes());
-        PathBuf::from(OsString::from_vec(encoded))
+        #[cfg(unix)]
+        {
+            let mut encoded = self.source.as_os_str().as_bytes().to_vec();
+            encoded.push(b':');
+            encoded.extend_from_slice(self.destination.as_os_str().as_bytes());
+            PathBuf::from(OsString::from_vec(encoded))
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(
+                "{}:{}",
+                self.source.display(),
+                self.destination.display()
+            ))
+        }
     }
 }
 
@@ -414,6 +481,22 @@ pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &[
     "NO_PROXY",
 ];
 
+#[cfg(windows)]
+const WINDOWS_DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+];
+
 /// Variable-name prefixes whose whole family is inherited by
 /// default: locale (`LC_*`), XDG base dirs (`XDG_*`), and terminal
 /// program metadata (`TERM_PROGRAM`, `TERM_PROGRAM_VERSION`).
@@ -421,8 +504,27 @@ pub const DEFAULT_ENV_PREFIXES: &[&str] = &["LC_", "XDG_", "TERM_PROGRAM"];
 
 /// Whether `name` is inherited into the sandbox by default.
 pub fn env_inherited_by_default(name: &str) -> bool {
-    DEFAULT_ENV_ALLOWLIST.contains(&name)
-        || DEFAULT_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+    let inherited = DEFAULT_ENV_ALLOWLIST.contains(&name)
+        || DEFAULT_ENV_PREFIXES.iter().any(|p| name.starts_with(p));
+    #[cfg(windows)]
+    {
+        inherited
+            || WINDOWS_DEFAULT_ENV_ALLOWLIST
+                .iter()
+                .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    }
+    #[cfg(not(windows))]
+    {
+        inherited
+    }
+}
+
+fn env_name_eq(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 /// Split an `--env` / `env_pass` entry into its variable name and
@@ -455,11 +557,11 @@ pub fn apply_env_pass(
         let value = explicit.map(str::to_string).or_else(|| {
             host_env
                 .iter()
-                .find(|(key, _)| key == name)
+                .find(|(key, _)| env_name_eq(key, name))
                 .map(|(_, value)| value.clone())
         });
         if let Some(value) = value {
-            env.retain(|(key, _)| key != name);
+            env.retain(|(key, _)| !env_name_eq(key, name));
             env.push((name.to_string(), value));
         }
     }
@@ -482,7 +584,16 @@ pub fn filtered_child_env(
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(CONFIG_FILE))
+    user_home_env().map(|home| home.join(CONFIG_FILE))
+}
+
+fn user_home_env() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+        })
+        .map(PathBuf::from)
 }
 
 pub fn parse_toml(contents: &str) -> Result<Config, String> {
@@ -515,6 +626,7 @@ enum SymlinkPolicy {
 /// read-write by default, so a target inside it could be rewritten by the
 /// very agent the policy is meant to constrain, and the next launch would
 /// then honor whatever capabilities it granted itself.
+#[cfg(unix)]
 fn trusted_symlink_target(path: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::MetadataExt;
 
@@ -545,6 +657,14 @@ fn trusted_symlink_target(path: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(target)
+}
+
+#[cfg(windows)]
+fn trusted_symlink_target(path: &Path) -> Result<PathBuf, String> {
+    Err(format!(
+        "symlinked global configs are not trusted on Windows ({})",
+        path.display()
+    ))
 }
 
 fn load_toml_from_path<T: Default>(
@@ -1095,6 +1215,7 @@ pub fn merge_with_global_report(
 /// Compatibility helper for trusted config-layer callers. Runtime project
 /// merging must use [`merge_with_global_report`] with an explicit project dir.
 #[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))]
 pub fn merge_with_global(global: Config, local: Config) -> Config {
     merge_trusted(global, local)
 }
@@ -1292,15 +1413,22 @@ pub fn expand_tilde(path: PathBuf) -> PathBuf {
         None => return path,
     };
     if s == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
+        if let Some(home) = user_home_env() {
+            return home;
         }
         return path;
     }
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
+    let rest = s.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            s.strip_prefix("~\\")
+        } else {
+            None
+        }
+    });
+    if let Some(rest) = rest
+        && let Some(home) = user_home_env()
     {
-        return PathBuf::from(home).join(rest);
+        return home.join(rest);
     }
     path
 }
@@ -1390,13 +1518,9 @@ pub fn absolutize_user_paths(config: &mut Config, cwd: &Path) {
 /// Returns the path unchanged if `$HOME` is unset or the path is not
 /// a `$HOME` descendant.
 pub fn collapse_tilde(path: &Path) -> PathBuf {
-    let Ok(home) = std::env::var("HOME") else {
+    let Some(home_path) = user_home_env() else {
         return path.to_path_buf();
     };
-    if home.is_empty() {
-        return path.to_path_buf();
-    }
-    let home_path = PathBuf::from(&home);
     if path == home_path {
         return PathBuf::from("~");
     }
@@ -1764,7 +1888,37 @@ fn print_allow_tcp_ports(ports: &[u16], lockdown: bool) {
     output::status_header("  Allow TCP ports", &format!("{joined}{note}"));
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn map_spec_distinguishes_drive_colons_from_destination_separator() {
+        let same = MapSpec::parse(Path::new(r"C:\work\data")).unwrap();
+        assert_eq!(same.source, PathBuf::from(r"C:\work\data"));
+        assert_eq!(same.destination, same.source);
+
+        let alternate =
+            MapSpec::parse(Path::new(r"C:\work\data:D:\sandbox\data")).unwrap();
+        assert_eq!(alternate.source, PathBuf::from(r"C:\work\data"));
+        assert_eq!(alternate.destination, PathBuf::from(r"D:\sandbox\data"));
+        assert_eq!(
+            alternate.encode(),
+            PathBuf::from(r"C:\work\data:D:\sandbox\data")
+        );
+    }
+
+    #[test]
+    fn windows_essential_environment_is_inherited_by_default() {
+        for name in ["SystemRoot", "COMSPEC", "PATHEXT", "USERPROFILE", "TEMP"]
+        {
+            assert!(env_inherited_by_default(name), "missing {name}");
+        }
+        assert!(!env_inherited_by_default("OPENAI_API_KEY"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::cli::CliArgs;

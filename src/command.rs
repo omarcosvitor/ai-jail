@@ -36,7 +36,17 @@ impl<'a> ManagedHarness<'a> {
 /// Basename of the process ai-jail was asked to invoke.
 pub(crate) fn basename(command: &[String]) -> Option<&str> {
     command.first().and_then(|cmd| {
-        Path::new(cmd).file_name().and_then(|name| name.to_str())
+        let name = Path::new(cmd).file_name()?.to_str()?;
+        #[cfg(windows)]
+        for extension in [".exe", ".com", ".cmd", ".bat"] {
+            if name.len() > extension.len()
+                && name[name.len() - extension.len()..]
+                    .eq_ignore_ascii_case(extension)
+            {
+                return Some(&name[..name.len() - extension.len()]);
+            }
+        }
+        Some(name)
     })
 }
 

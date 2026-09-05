@@ -151,11 +151,19 @@ fn ensure_regular_file_or_absent(path: &Path) -> Result<(), String> {
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     crate::fsutil::write_atomic(path, contents, true, "bootstrap")?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("Failed to secure {}: {e}", path.display()))
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed to secure {}: {e}", path.display()))
+    }
+    #[cfg(windows)]
+    {
+        Ok(())
+    }
 }
 
 fn backup_file(path: &Path) -> Result<bool, String> {
@@ -174,7 +182,8 @@ fn user_home_dir() -> Result<PathBuf, String> {
     const REFUSAL: &str = "refusing to bootstrap AI tool configs \
                            into a fallback location";
     let raw = std::env::var("HOME")
-        .map_err(|_| format!("HOME is not set; {REFUSAL}"))?;
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| format!("HOME/USERPROFILE is not set; {REFUSAL}"))?;
     if raw.is_empty() {
         return Err(format!("HOME is empty; {REFUSAL}"));
     }
@@ -552,7 +561,7 @@ fn bootstrap_crush(verbose: bool) -> Result<(), String> {
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
