@@ -181,9 +181,10 @@ fn backup_file(path: &Path) -> Result<bool, String> {
 fn user_home_dir() -> Result<PathBuf, String> {
     const REFUSAL: &str = "refusing to bootstrap AI tool configs \
                            into a fallback location";
-    let raw = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| format!("HOME/USERPROFILE is not set; {REFUSAL}"))?;
+    let raw = std::env::var("HOME");
+    #[cfg(windows)]
+    let raw = raw.or_else(|_| std::env::var("USERPROFILE"));
+    let raw = raw.map_err(|_| format!("HOME is not set; {REFUSAL}"))?;
     if raw.is_empty() {
         return Err(format!("HOME is empty; {REFUSAL}"));
     }

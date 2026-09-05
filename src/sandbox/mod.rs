@@ -510,10 +510,14 @@ pub fn dotdir_exemptions(config: &Config) -> Vec<&'static str> {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    let home = std::env::var_os("HOME");
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE"));
+    #[cfg(unix)]
+    let fallback = PathBuf::from("/tmp");
+    #[cfg(windows)]
+    let fallback = std::env::temp_dir();
+    home.map(PathBuf::from).unwrap_or(fallback)
 }
 
 /// Paths below `root` that must stay visible for the sandboxed command

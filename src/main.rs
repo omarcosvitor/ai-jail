@@ -555,7 +555,7 @@ fn run() -> Result<i32, String> {
         }
     } else {
         // Non-interactive and --exec paths preserve inherited/piped stdio.
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start sandbox: {e}"))?;
 
@@ -568,11 +568,14 @@ fn run() -> Result<i32, String> {
             code
         };
         #[cfg(windows)]
-        let code = child
-            .wait()
-            .map_err(|e| format!("Failed waiting for sandbox: {e}"))?
-            .code()
-            .unwrap_or(1);
+        let code = {
+            let mut child = child;
+            child
+                .wait()
+                .map_err(|e| format!("Failed waiting for sandbox: {e}"))?
+                .code()
+                .unwrap_or(1)
+        };
         // Defensive terminal reset — see issue #40. The child may
         // have left mouse tracking, alt-screen, etc. on. The PTY path
         // does its own reset in pty::run; here we cover the

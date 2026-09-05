@@ -588,12 +588,12 @@ fn global_config_path() -> Option<PathBuf> {
 }
 
 fn user_home_env() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
-        })
-        .map(PathBuf::from)
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| {
+        std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+    });
+    home.map(PathBuf::from)
 }
 
 pub fn parse_toml(contents: &str) -> Result<Config, String> {
