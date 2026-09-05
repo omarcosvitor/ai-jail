@@ -1,16 +1,34 @@
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("ai-jail only supports Linux and macOS");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("ai-jail only supports Linux, macOS, and Windows");
 
 mod bootstrap;
 mod cli;
 mod command;
 mod config;
+#[cfg(unix)]
+mod fsutil;
+#[cfg(windows)]
+#[path = "fsutil_windows.rs"]
 mod fsutil;
 mod output;
+#[cfg(unix)]
+mod pty;
+#[cfg(windows)]
+#[path = "pty_windows.rs"]
 mod pty;
 mod sandbox;
+#[cfg(unix)]
 mod signals;
+#[cfg(windows)]
+#[path = "signals_windows.rs"]
+mod signals;
+#[cfg(unix)]
 mod statusbar;
+#[cfg(windows)]
+#[path = "statusbar_windows.rs"]
+mod statusbar;
+#[cfg(windows)]
+mod terminal_filter;
 
 #[cfg(test)]
 mod test_utils;
@@ -95,6 +113,7 @@ fn default_resize_redraw_key(command: &[String]) -> Option<&'static str> {
     }
 }
 
+#[cfg(unix)]
 fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     use std::os::unix::process::CommandExt;
 
@@ -163,8 +182,14 @@ fn run_landlock_exec(cli: &cli::CliArgs) -> Result<i32, String> {
     Err(format!("Failed to exec {}: {err}", cli.command[0]))
 }
 
+#[cfg(windows)]
+fn run_landlock_exec(_cli: &cli::CliArgs) -> Result<i32, String> {
+    Err("--landlock-exec is an internal Linux-only option".into())
+}
+
 /// Drop `PATH` entries that are not directories here, returning the rewritten
 /// value with the kept and original counts. `None` when nothing changed.
+#[cfg(any(unix, test))]
 fn prune_missing_path_entries(
     path: &std::ffi::OsStr,
 ) -> Option<(std::ffi::OsString, usize, usize)> {
@@ -397,7 +422,8 @@ fn run() -> Result<i32, String> {
     let explicit_status_bar =
         cli.status_bar_style.is_some() || config.no_status_bar == Some(false);
     let multiplexer_skip = multiplexer.is_some() && !explicit_status_bar;
-    let use_status_bar = config.status_bar_enabled()
+    let use_status_bar = !cfg!(windows)
+        && config.status_bar_enabled()
         && stdout_is_tty
         && stdin_is_tty
         && !cli.exec
@@ -409,7 +435,9 @@ fn run() -> Result<i32, String> {
     // filters (see pty_proxy_active).
     let use_pty = pty_proxy_active(cli.exec, stdout_is_tty);
     if cli.verbose {
-        if config.status_bar_enabled() {
+        if cfg!(windows) && config.status_bar_enabled() {
+            output::verbose("Status bar: not available on Windows yet");
+        } else if config.status_bar_enabled() {
             if needs_direct_tty {
                 output::verbose(&format!(
                     "Status bar: skipped ({} requires direct terminal passthrough)",
@@ -531,11 +559,23 @@ fn run() -> Result<i32, String> {
             .spawn()
             .map_err(|e| format!("Failed to start sandbox: {e}"))?;
 
-        let pid = child.id() as i32;
-        signals::set_child_pid(pid);
-
-        let code = signals::wait_child(pid);
-        std::mem::forget(child);
+        #[cfg(unix)]
+        let code = {
+            let pid = child.id() as i32;
+            signals::set_child_pid(pid);
+            let code = signals::wait_child(pid);
+            std::mem::forget(child);
+            code
+        };
+        #[cfg(windows)]
+        let code = {
+            let mut child = child;
+            child
+                .wait()
+                .map_err(|e| format!("Failed waiting for sandbox: {e}"))?
+                .code()
+                .unwrap_or(1)
+        };
         // Defensive terminal reset — see issue #40. The child may
         // have left mouse tracking, alt-screen, etc. on. The PTY path
         // does its own reset in pty::run; here we cover the
@@ -548,7 +588,10 @@ fn run() -> Result<i32, String> {
     // guard is a unit struct (no temp files to clean), so the explicit
     // drop is a no-op there; clippy's drop_non_drop only fires on that
     // platform. The drop stays meaningful on Linux (RAII temp files).
-    #[cfg_attr(target_os = "macos", allow(clippy::drop_non_drop))]
+    #[cfg_attr(
+        any(target_os = "macos", windows),
+        allow(clippy::drop_non_drop)
+    )]
     drop(guard);
 
     Ok(exit_code)
