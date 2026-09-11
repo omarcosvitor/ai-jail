@@ -3,7 +3,7 @@ use std::path::PathBuf;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HELP: &str = "\
-ai-jail — sandbox for AI coding agents (bwrap on Linux, sandbox-exec on macOS)
+ai-jail — sandbox for AI coding agents (bwrap on Linux, sandbox-exec on macOS, ProcessContainer on Windows)
 
 USAGE:
     ai-jail [OPTIONS] [--] [COMMAND [ARGS...]]
