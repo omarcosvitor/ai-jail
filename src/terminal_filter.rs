@@ -33,13 +33,26 @@ enum FilterState {
     Csi,
     String,
     StringEsc,
+    /// Inside `ESC %` — a character-set designation, dropped whole.
+    Charset,
 }
 
 /// Retains text and display controls while dropping OSC, DCS, APC, PM, and
 /// terminal capability queries.
+///
+/// The child's output is UTF-8. A byte in `0x80..=0x9f` is only an 8-bit C1
+/// control when it stands on its own; inside a multi-byte character it is a
+/// continuation byte and must pass through untouched. The block characters
+/// U+2590..U+259F (`▐▛▜▝…`, the Claude Code logo) encode as `E2 96 90..9F`,
+/// so without that distinction the filter mistook them for DCS/CSI/OSC
+/// introducers and a C1 ST, swallowing rows of the banner and leaking the
+/// tail of the window-title OSC as text.
 pub(crate) struct TerminalFilter {
     state: FilterState,
     pending: Vec<u8>,
+    /// Continuation bytes still expected for the UTF-8 character in
+    /// progress; while non-zero, `0x80..=0xbf` is character data.
+    utf8_remaining: u8,
 }
 
 impl TerminalFilter {
@@ -47,12 +60,61 @@ impl TerminalFilter {
         Self {
             state: FilterState::Ground,
             pending: Vec::new(),
+            utf8_remaining: 0,
         }
+    }
+
+    /// Track UTF-8 sequence boundaries. Returns `true` when `byte` is part
+    /// of a multi-byte character (lead or continuation byte) and must be
+    /// treated as plain data rather than a C1 control.
+    fn utf8_char_byte(&mut self, byte: u8) -> bool {
+        if self.utf8_remaining > 0 {
+            if (0x80..=0xbf).contains(&byte) {
+                self.utf8_remaining -= 1;
+                return true;
+            }
+            // Truncated sequence: `byte` stands on its own.
+            self.utf8_remaining = 0;
+        }
+        self.utf8_remaining = match byte {
+            0xc2..=0xdf => 1,
+            0xe0..=0xef => 2,
+            0xf0..=0xf4 => 3,
+            _ => 0,
+        };
+        self.utf8_remaining > 0
     }
 
     pub(crate) fn feed(&mut self, data: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(data.len());
         for &byte in data {
+            if self.utf8_char_byte(byte) {
+                // Character data: never an introducer or terminator.
+                match self.state {
+                    FilterState::Ground => out.push(byte),
+                    FilterState::Esc => {
+                        self.pending.push(byte);
+                        out.extend_from_slice(&self.pending);
+                        self.pending.clear();
+                        self.state = FilterState::Ground;
+                    }
+                    FilterState::Csi => {
+                        self.pending.push(byte);
+                        if self.pending.len() > OSC_MAX_LEN {
+                            self.pending.clear();
+                            self.state = FilterState::Ground;
+                        }
+                    }
+                    FilterState::String => {}
+                    FilterState::StringEsc => {
+                        self.state = FilterState::String;
+                    }
+                    // Payload bytes here are ASCII in practice; drop any
+                    // stray byte with the rest of the sequence.
+                    FilterState::Charset => self.state = FilterState::Ground,
+                }
+                continue;
+            }
             match self.state {
                 FilterState::Ground => {
                     if byte == 0x1b {
@@ -72,6 +134,17 @@ impl TerminalFilter {
                         self.pending.push(byte);
                         self.state = FilterState::Csi;
                     }
+                    // `ESC % @` returns the terminal to ISO 8859-1, where
+                    // 0x80..=0x9f are C1 controls again. Everything below
+                    // assumes the terminal stays in UTF-8 mode — that is what
+                    // makes it safe to pass a continuation byte through as
+                    // character data — so the sequence that revokes the
+                    // assumption has to go. Dropped rather than forwarded:
+                    // ai-jail always speaks UTF-8 to the terminal.
+                    b'%' => {
+                        self.pending.clear();
+                        self.state = FilterState::Charset;
+                    }
                     b']' | b'P' | b'X' | b'^' | b'_' => {
                         self.pending.clear();
                         self.state = FilterState::String;
@@ -83,6 +156,13 @@ impl TerminalFilter {
                         self.state = FilterState::Ground;
                     }
                 },
+                // `ESC % / F` designates a multi-byte set; `/` means one
+                // more byte follows. Anything else ends the sequence.
+                FilterState::Charset => {
+                    if byte != b'/' {
+                        self.state = FilterState::Ground;
+                    }
+                }
                 FilterState::Csi => {
                     self.pending.push(byte);
                     if (0x40..=0x7e).contains(&byte) {
@@ -140,5 +220,56 @@ mod tests {
         let mut filter = TerminalFilter::new();
         assert_eq!(filter.feed(b"before\x1b]52;c;sec"), b"before");
         assert_eq!(filter.feed(b"ret\x07after"), b"after");
+    }
+
+    #[test]
+    fn passes_utf8_block_characters_through() {
+        // U+2590..U+259F encode as E2 96 90..9F: the continuation bytes
+        // coincide with the C1 DCS (0x90), CSI (0x9b), ST (0x9c), OSC
+        // (0x9d) codes. The Claude Code logo is drawn with them.
+        let mut filter = TerminalFilter::new();
+        let logo = " ▐\x1b[48;2;0;0;0m▛████▜█\x1b[12G\x1b[1mClaude\x1b[19GCode"
+            .as_bytes();
+        assert_eq!(filter.feed(logo), logo);
+        assert_eq!(filter.feed("😀 ok".as_bytes()), "😀 ok".as_bytes());
+    }
+
+    #[test]
+    fn utf8_character_split_across_reads() {
+        let mut filter = TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xe2\x96"), b"\xe2\x96");
+        // 0x9c here is the last byte of U+259C, not a C1 ST.
+        assert_eq!(filter.feed(b"\x9c rest"), b"\x9c rest");
+    }
+
+    #[test]
+    fn drops_osc_title_with_utf8_payload_whole() {
+        // OSC 0 with "✳" (E2 9C B3) in the title: the 0x9c continuation
+        // byte used to terminate the string early and leak the tail as text.
+        let mut filter = TerminalFilter::new();
+        assert_eq!(
+            filter.feed("\x1b]0;✳ Claude Code\x07after".as_bytes()),
+            b"after"
+        );
+    }
+
+    #[test]
+    fn c1_after_complete_utf8_char_is_still_recognized() {
+        let mut filter = TerminalFilter::new();
+        assert_eq!(filter.feed(b"\xc3\xa9\x9d0;evil\x07ok"), b"\xc3\xa9ok");
+    }
+
+    #[test]
+    fn drops_charset_designation() {
+        // `ESC % @` returns the terminal to ISO 8859-1, where 0x80..=0x9f
+        // are C1 controls again, so an agent could smuggle a C1 CSI through
+        // as a UTF-8 continuation byte.
+        let mut filter = TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b%@"), b"");
+        assert_eq!(filter.feed(b"\x1b%G"), b"");
+        // `ESC % / F` designates a multi-byte set: three bytes after ESC.
+        assert_eq!(filter.feed(b"\x1b%/4"), b"");
+        assert_eq!(filter.feed(b"ok\x1b%@done"), b"okdone");
+        assert_eq!(filter.feed(b"\x1b%@\xe2\x96\x9c"), b"\xe2\x96\x9c");
     }
 }
