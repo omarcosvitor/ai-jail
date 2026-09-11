@@ -691,6 +691,185 @@ fn quote_for_display(argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{ENV_LOCK, EnvVarGuard};
+
+    struct PolicyFixture {
+        home: PathBuf,
+        project: PathBuf,
+        _home_guard: EnvVarGuard,
+    }
+
+    impl PolicyFixture {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("ai-jail-policy-{label}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let home = root.join("home");
+            let project = root.join("project");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::create_dir_all(&project).unwrap();
+            let _home_guard = EnvVarGuard::set("HOME", home.as_os_str());
+            Self {
+                home,
+                project,
+                _home_guard,
+            }
+        }
+
+        fn policy(&self, config: &Config) -> Value {
+            build_policy(config, &self.project).unwrap().0
+        }
+    }
+
+    impl Drop for PolicyFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(
+                self.project.parent().unwrap_or(&self.project),
+            );
+        }
+    }
+
+    fn paths(policy: &Value, key: &str) -> Vec<String> {
+        policy["filesystem"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn lists(policy: &Value, key: &str, path: &Path) -> bool {
+        let wanted = path.to_string_lossy();
+        paths(policy, key).iter().any(|entry| entry == &wanted)
+    }
+
+    #[test]
+    fn policy_denies_the_network_by_default() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("net-default");
+        let policy = fixture.policy(&Config::default());
+        assert_eq!(policy["network"]["egress"]["default"], "deny");
+        assert_eq!(policy["network"]["ingress"]["default"], "deny");
+        assert_eq!(policy["network"]["ingress"]["hostLoopback"], "deny");
+    }
+
+    #[test]
+    fn policy_opens_the_network_only_when_it_is_enabled() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("net-enabled");
+        let policy = fixture.policy(&Config {
+            network: Some(true),
+            ..Config::default()
+        });
+        assert_eq!(policy["network"]["egress"]["default"], "allow");
+        assert_eq!(policy["network"]["ingress"]["default"], "allow");
+        assert_eq!(policy["network"]["ingress"]["hostLoopback"], "allow");
+    }
+
+    #[test]
+    fn lockdown_keeps_the_network_closed_even_when_enabled() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("net-lockdown");
+        let policy = fixture.policy(&Config {
+            network: Some(true),
+            lockdown: Some(true),
+            ..Config::default()
+        });
+        assert_eq!(policy["network"]["egress"]["default"], "deny");
+        assert_eq!(policy["network"]["ingress"]["default"], "deny");
+    }
+
+    #[test]
+    fn the_project_is_writable_outside_lockdown_and_read_only_inside_it() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("project-mode");
+        let open = fixture.policy(&Config::default());
+        assert!(lists(&open, "readwritePaths", &fixture.project));
+        assert!(!lists(&open, "readonlyPaths", &fixture.project));
+
+        let locked = fixture.policy(&Config {
+            lockdown: Some(true),
+            ..Config::default()
+        });
+        assert!(lists(&locked, "readonlyPaths", &fixture.project));
+        assert!(!lists(&locked, "readwritePaths", &fixture.project));
+    }
+
+    #[test]
+    fn private_home_keeps_the_profile_out_of_the_writable_set() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("private-home");
+        let private = fixture.policy(&Config::default());
+        assert!(!lists(&private, "readwritePaths", &fixture.home));
+
+        let shared = fixture.policy(&Config {
+            private_home: Some(false),
+            ..Config::default()
+        });
+        assert!(lists(&shared, "readwritePaths", &fixture.home));
+    }
+
+    #[test]
+    fn denied_paths_reach_the_policy() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("denied");
+        let secret = fixture.project.join("secret.env");
+        std::fs::write(&secret, "TOKEN=1").unwrap();
+        let policy = fixture.policy(&Config {
+            deny_paths: vec![secret.clone()],
+            ..Config::default()
+        });
+        assert!(lists(&policy, "deniedPaths", &secret));
+    }
+
+    #[test]
+    fn lockdown_drops_extra_maps() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("lockdown-maps");
+        let extra = fixture.home.join("shared");
+        std::fs::create_dir_all(&extra).unwrap();
+        let config = Config {
+            lockdown: Some(true),
+            rw_maps: vec![extra.clone()],
+            ..Config::default()
+        };
+        let policy = fixture.policy(&config);
+        assert!(!lists(&policy, "readwritePaths", &extra));
+        assert!(!lists(&policy, "readonlyPaths", &extra));
+    }
+
+    #[test]
+    fn read_write_maps_are_granted_outside_lockdown() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("maps");
+        let writable = fixture.home.join("shared");
+        let readable = fixture.home.join("reference");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::create_dir_all(&readable).unwrap();
+        let policy = fixture.policy(&Config {
+            rw_maps: vec![writable.clone()],
+            ro_maps: vec![readable.clone()],
+            ..Config::default()
+        });
+        assert!(lists(&policy, "readwritePaths", &writable));
+        assert!(lists(&policy, "readonlyPaths", &readable));
+    }
+
+    #[test]
+    fn policy_targets_processcontainer_and_does_not_outlive_the_run() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let fixture = PolicyFixture::new("scaffolding");
+        let policy = fixture.policy(&Config::default());
+        assert_eq!(policy["version"], "0.8.0-alpha");
+        assert_eq!(policy["containment"], "processcontainer");
+        assert_eq!(policy["lifecycle"]["destroyOnExit"], true);
+        assert_eq!(policy["lifecycle"]["preservePolicy"], false);
+        assert_eq!(policy["processContainer"]["ui"]["isolation"], "container");
+        assert_eq!(
+            policy["process"]["cwd"],
+            fixture.project.to_string_lossy().as_ref()
+        );
+    }
 
     #[test]
     fn base64_matches_rfc_4648_vectors() {
