@@ -138,16 +138,28 @@ fn command_builder(command: &std::process::Command) -> CommandBuilder {
     builder
 }
 
+fn content_size(size: PtySize, status_bar: bool) -> PtySize {
+    if status_bar && size.rows > 1 {
+        PtySize {
+            rows: size.rows - 1,
+            ..size
+        }
+    } else {
+        size
+    }
+}
+
 pub fn run_with_config(
     _pty: Pty,
     command: &mut std::process::Command,
     resize_redraw_key: Option<&[u8]>,
     config: &crate::config::Config,
-    _status_bar: bool,
+    status_bar: bool,
 ) -> Result<i32, String> {
+    let status_bar = status_bar && crate::statusbar::is_active();
     let size = terminal_size().unwrap_or_default();
     let pair = native_pty_system()
-        .openpty(size)
+        .openpty(content_size(size, status_bar))
         .map_err(|error| format!("Failed to open ConPTY: {error}"))?;
     let mut child = pair
         .slave
@@ -164,19 +176,25 @@ pub fn run_with_config(
     let output_thread = std::thread::spawn(move || {
         let result = (|| -> std::io::Result<()> {
             let mut filter = TerminalFilter::new();
-            let mut stdout = std::io::stdout().lock();
             let mut buffer = [0u8; 8192];
             loop {
                 let read = reader.read(&mut buffer)?;
                 if read == 0 {
                     break;
                 }
-                if terminal_passthrough {
-                    stdout.write_all(&buffer[..read])?;
-                } else {
-                    stdout.write_all(&filter.feed(&buffer[..read]))?;
+                {
+                    // Held per chunk so a status bar redraw can interleave.
+                    let mut stdout = std::io::stdout().lock();
+                    if terminal_passthrough {
+                        stdout.write_all(&buffer[..read])?;
+                    } else {
+                        stdout.write_all(&filter.feed(&buffer[..read]))?;
+                    }
+                    stdout.flush()?;
                 }
-                stdout.flush()?;
+                if status_bar {
+                    crate::statusbar::redraw();
+                }
             }
             Ok(())
         })();
@@ -204,13 +222,20 @@ pub fn run_with_config(
             break status;
         }
 
+        if status_bar && crate::statusbar::take_requests() {
+            crate::statusbar::redraw();
+        }
+
         if let Some(size) = terminal_size()
             && size != previous_size
         {
             pair.master
-                .resize(size)
+                .resize(content_size(size, status_bar))
                 .map_err(|error| format!("Failed to resize ConPTY: {error}"))?;
             previous_size = size;
+            if status_bar {
+                crate::statusbar::redraw();
+            }
             if let Some(key) = resize_redraw_key {
                 writer.write_all(key).map_err(|error| {
                     format!("Failed to request redraw: {error}")

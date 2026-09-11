@@ -422,8 +422,7 @@ fn run() -> Result<i32, String> {
     let explicit_status_bar =
         cli.status_bar_style.is_some() || config.no_status_bar == Some(false);
     let multiplexer_skip = multiplexer.is_some() && !explicit_status_bar;
-    let use_status_bar = !cfg!(windows)
-        && config.status_bar_enabled()
+    let use_status_bar = config.status_bar_enabled()
         && stdout_is_tty
         && stdin_is_tty
         && !cli.exec
@@ -435,9 +434,7 @@ fn run() -> Result<i32, String> {
     // filters (see pty_proxy_active).
     let use_pty = pty_proxy_active(cli.exec, stdout_is_tty);
     if cli.verbose {
-        if cfg!(windows) && config.status_bar_enabled() {
-            output::verbose("Status bar: not available on Windows yet");
-        } else if config.status_bar_enabled() {
+        if config.status_bar_enabled() {
             if needs_direct_tty {
                 output::verbose(&format!(
                     "Status bar: skipped ({} requires direct terminal passthrough)",
