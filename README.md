@@ -49,7 +49,8 @@ SDK: `npm install -g @microsoft/mxc-sdk@0.8.0`. The binary is looked up next to
 `ai-jail.exe`, on `PATH`, and in the global npm prefix; `WXC_EXEC_BIN` overrides
 the lookup. Every run probes the backend first and refuses to start when the
 host cannot provide it, in which case WSL2 with the Linux backend inside it
-remains the fallback.
+remains the fallback. Releases carry Linux and macOS archives only, so on
+Windows build from source.
 
 ## Quick start
 
@@ -371,11 +372,27 @@ mise still initializes. Silence it by masking the offending script
 (`mask = ["/etc/profile.d/im-config_wayland.sh"]`) or by skipping mise setup
 entirely with `--no-mise`.
 
+**`wxc-exec.exe not found` or `Windows ProcessContainer is unavailable`.**
+The native Windows backend needs Microsoft's MXC SDK and a Windows build that
+actually ships ProcessContainer. Install the SDK with
+`npm install -g @microsoft/mxc-sdk@0.8.0`, then run the probe ai-jail runs:
+
+```powershell
+wxc-exec --probe
+```
+
+A missing `tier`, or one reading `unsupported` or `unavailable`, means the host
+cannot provide the container; ai-jail refuses to start rather than run the
+agent unsandboxed. If the SDK lives somewhere the lookup misses — it checks
+next to `ai-jail.exe`, every `PATH` entry, and the `node_modules` trees under
+`%APPDATA%` and `%ProgramFiles%` — point `WXC_EXEC_BIN` at the binary.
+Otherwise run ai-jail inside WSL2 on the Linux backend.
+
 ## Platform and threat model
 
 Linux uses namespace isolation and, where available, Landlock, seccomp, and
 resource limits. macOS has no global filesystem reads, network, or host IPC by
-default; `--agent-state` and other state mounts work on both platforms.
+default; `--agent-state` and other state mounts work on all three platforms.
 Overlay maps are copy-on-write on Linux only; on macOS and Windows they are
 honored as read-only maps. `sandbox-exec` is deprecated and no backend protects
 against kernel/driver vulnerabilities, terminal emulator vulnerabilities, or
@@ -384,8 +401,8 @@ disposable VM.
 
 Windows grants the project directory and the paths you map, denies the rest of
 the user profile, and keeps network egress and ingress closed unless
-`--network` is set. Docker, Tailscale, and SSH-agent passthrough, the status
-bar, and alternate map destinations (`--map src:dst`) are not available there;
+`--network` is set. Docker, Tailscale, and SSH-agent passthrough and alternate
+map destinations (`--map src:dst`) are not available there;
 `~/.ssh` and overlay maps are exposed read-only, and a symlinked global config
 is refused instead of followed.
 
