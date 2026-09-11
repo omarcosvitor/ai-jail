@@ -17,6 +17,13 @@ pub(crate) fn csi_final_forwardable(
     }
 }
 
+/// Whether a complete CSI sequence is the cursor-position request `ESC [ 6 n`.
+/// ConPTY sends exactly that form; parameterised variants are not recognised.
+fn cursor_position_query(pending: &[u8]) -> bool {
+    let start = if pending[0] == 0x9b { 1 } else { 2 };
+    pending.get(start..pending.len() - 1) == Some(b"6".as_slice())
+}
+
 /// Conservative recognition of replies produced by a real terminal.
 pub(crate) fn looks_like_terminal_reply(data: &[u8]) -> bool {
     (data.starts_with(b"\x1b[") || data.starts_with(&[0x9b]))
@@ -53,6 +60,11 @@ pub(crate) struct TerminalFilter {
     /// Continuation bytes still expected for the UTF-8 character in
     /// progress; while non-zero, `0x80..=0xbf` is character data.
     utf8_remaining: u8,
+    /// Cursor-position requests dropped since the last drain. ConPTY opens
+    /// by asking the host where the cursor is and withholds every byte the
+    /// child writes until it is answered, so the caller has to reply on the
+    /// terminal's behalf instead of forwarding the query to it.
+    cursor_reports: u32,
 }
 
 impl TerminalFilter {
@@ -61,7 +73,13 @@ impl TerminalFilter {
             state: FilterState::Ground,
             pending: Vec::new(),
             utf8_remaining: 0,
+            cursor_reports: 0,
         }
+    }
+
+    /// Take the cursor-position requests seen since the last call.
+    pub(crate) fn take_cursor_reports(&mut self) -> u32 {
+        std::mem::take(&mut self.cursor_reports)
     }
 
     /// Track UTF-8 sequence boundaries. Returns `true` when `byte` is part
@@ -171,6 +189,12 @@ impl TerminalFilter {
                             .get(if self.pending[0] == 0x9b { 1 } else { 2 })
                             .copied()
                             .filter(|p| matches!(p, b'>' | b'<' | b'?'));
+                        if byte == b'n'
+                            && prefix.is_none()
+                            && cursor_position_query(&self.pending)
+                        {
+                            self.cursor_reports += 1;
+                        }
                         if !csi_final_forwardable(byte, prefix) && byte != b'n'
                         {
                             out.extend_from_slice(&self.pending);
@@ -257,6 +281,27 @@ mod tests {
     fn c1_after_complete_utf8_char_is_still_recognized() {
         let mut filter = TerminalFilter::new();
         assert_eq!(filter.feed(b"\xc3\xa9\x9d0;evil\x07ok"), b"\xc3\xa9ok");
+    }
+
+    #[test]
+    fn counts_the_cursor_position_requests_it_drops() {
+        // ConPTY withholds every byte the child writes until this query is
+        // answered, so dropping it without recording it deadlocks the proxy.
+        let mut filter = TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b[6n"), b"");
+        assert_eq!(filter.take_cursor_reports(), 1);
+        assert_eq!(filter.take_cursor_reports(), 0);
+        assert_eq!(filter.feed(b"a\x1b[6"), b"a");
+        assert_eq!(filter.take_cursor_reports(), 0);
+        assert_eq!(filter.feed(b"n\x1b[6nb"), b"b");
+        assert_eq!(filter.take_cursor_reports(), 2);
+    }
+
+    #[test]
+    fn other_status_reports_are_not_cursor_queries() {
+        let mut filter = TerminalFilter::new();
+        assert_eq!(filter.feed(b"\x1b[5n\x1b[?6n\x1b[n\x1b[16n"), b"");
+        assert_eq!(filter.take_cursor_reports(), 0);
     }
 
     #[test]

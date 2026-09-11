@@ -84,6 +84,43 @@ fn terminal_size() -> Option<PtySize> {
     })
 }
 
+fn cursor_position() -> Option<(u16, u16)> {
+    let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+    let ok = unsafe {
+        GetConsoleScreenBufferInfo(console_handle(STD_OUTPUT_HANDLE), &mut info)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let row =
+        i32::from(info.dwCursorPosition.Y) - i32::from(info.srWindow.Top) + 1;
+    let col =
+        i32::from(info.dwCursorPosition.X) - i32::from(info.srWindow.Left) + 1;
+    Some((row.max(1) as u16, col.max(1) as u16))
+}
+
+/// Answer ConPTY's opening cursor-position request with where the console
+/// cursor really is, clamped to the rows ConPTY owns. Reporting a position it
+/// cannot address would desynchronise every absolute cursor move that follows.
+fn cursor_report(status_bar: bool) -> Vec<u8> {
+    let rows = content_size(terminal_size().unwrap_or_default(), status_bar)
+        .rows
+        .max(1);
+    let (row, col) = cursor_position().unwrap_or((1, 1));
+    format!("\x1b[{};{col}R", row.min(rows)).into_bytes()
+}
+
+fn write_to_pty(
+    writer: &std::sync::Mutex<Box<dyn Write + Send>>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("ConPTY writer lock poisoned"))?;
+    writer.write_all(bytes)?;
+    writer.flush()
+}
+
 struct RawModeGuard {
     handle: HANDLE,
     saved: u32,
@@ -172,6 +209,15 @@ pub fn run_with_config(
         .try_clone_reader()
         .map_err(|error| format!("Failed to read ConPTY: {error}"))?;
     let terminal_passthrough = config.terminal_passthrough_enabled();
+    // Shared with the output thread so a cursor query can be answered the
+    // moment it arrives: the main loop can sit inside a blocking stdin read
+    // until the next keystroke, and ConPTY stays silent until it is answered.
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(
+        pair.master
+            .take_writer()
+            .map_err(|error| format!("Failed to write ConPTY: {error}"))?,
+    ));
+    let reply_writer = std::sync::Arc::clone(&writer);
     let (output_sender, output_receiver) = std::sync::mpsc::channel();
     let output_thread = std::thread::spawn(move || {
         let result = (|| -> std::io::Result<()> {
@@ -192,6 +238,9 @@ pub fn run_with_config(
                     }
                     stdout.flush()?;
                 }
+                for _ in 0..filter.take_cursor_reports() {
+                    write_to_pty(&reply_writer, &cursor_report(status_bar))?;
+                }
                 if status_bar {
                     crate::statusbar::redraw();
                 }
@@ -201,10 +250,6 @@ pub fn run_with_config(
         let _ = output_sender.send(result);
     });
 
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|error| format!("Failed to write ConPTY: {error}"))?;
     let _raw_mode = if std::io::stdin().is_terminal() {
         Some(RawModeGuard::enter()?)
     } else {
@@ -237,10 +282,9 @@ pub fn run_with_config(
                 crate::statusbar::redraw();
             }
             if let Some(key) = resize_redraw_key {
-                writer.write_all(key).map_err(|error| {
+                write_to_pty(&writer, key).map_err(|error| {
                     format!("Failed to request redraw: {error}")
                 })?;
-                writer.flush().ok();
             }
         }
 
@@ -253,10 +297,9 @@ pub fn run_with_config(
                     if terminal_passthrough
                         || !looks_like_terminal_reply(&input[..read]) =>
                 {
-                    writer.write_all(&input[..read]).map_err(|error| {
+                    write_to_pty(&writer, &input[..read]).map_err(|error| {
                         format!("Failed forwarding input to ConPTY: {error}")
                     })?;
-                    writer.flush().ok();
                 }
                 Ok(_) => {}
                 Err(error)
